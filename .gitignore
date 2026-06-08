@@ -1,0 +1,20 @@
+# --- Datos sensibles del docente (no publicar, seccion f de la guia) ---
+telemetria_grupo.csv
+*.csv
+!ejemplo*.csv          # permite subir CSVs de ejemplo si los nombras asi
+
+# --- Artefactos de compilacion de Arduino / PlatformIO ---
+build/
+*.bin
+*.elf
+*.hex
+*.map
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# --- IDE / sistema ---
+.vscode/
+.DS_Store
+Thumbs.db
+*~

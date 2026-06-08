@@ -14,16 +14,20 @@ detecta su portadora mediante barrido espectral y la interfiere.
 ```
 lora-csma/
 ├── Guia.pdf                 # Guía oficial del taller
-├── telemetria_grupo.csv     # CSV de telemetría asignado (id_msg,temp,hum,timestamp)
+├── telemetria_grupo.csv     # CSV de telemetría asignado (NO se sube a git)
 ├── csma_rx.ino              # Nodo RECEPTOR legítimo (CSMA/CA, ACK, OLED, PDR)
+├── csma_tx/
+│   └── csma_tx.ino          # Nodo TRANSMISOR/FUENTE (CSMA/CA + CAD + BEB)
 ├── jammer/
 │   └── jammer.ino           # Nodo JAMMER (barrido espectral + ataque)
+├── .gitignore
 └── README.md
 ```
 
 > ⚠️ **Compilación:** cada nodo es un *sketch* independiente. Arduino concatena todos los
-> `.ino` de una misma carpeta, por eso `jammer.ino` vive en su **propia carpeta** `jammer/`.
-> No lo compiles junto a `csma_rx.ino` (ambos definen `setup()`/`loop()`).
+> `.ino` de una misma carpeta, por eso `csma_tx.ino` y `jammer.ino` viven en sus **propias
+> carpetas**. Dos sketches en la misma carpeta dan error (ambos definen `setup()`/`loop()`).
+> Para mantener todo limpio conviene mover también `csma_rx.ino` a una carpeta `csma_rx/`.
 
 ---
 
@@ -105,6 +109,42 @@ Implementa las tres fases de la Parte VI de la guía, **controladas por el Monit
 ```
 
 ---
+
+## 🟢 Nodo Transmisor / Fuente — `csma_tx/csma_tx.ino`
+
+Emite el CSV de telemetría fila por fila implementando **CSMA/CA con CAD + BEB**. Núcleo:
+la función `csmaCaSend()`.
+
+1. **CAD** (`radio.scanChannel()`) escucha el canal antes de transmitir.
+2. Si está **ocupado** → backoff exponencial binario y reintenta → imprime `[BUSY]`.
+3. Si está **libre** → transmite la trama de datos.
+4. Espera **ACK** del receptor; si no llega → colisión → backoff y reintenta (`[NACK]`).
+5. Tras `MAX_BACKOFF_K` reintentos sin éxito → `[RECHAZADO] Canal asfixiado`: el puntero
+   `idxCsv` **NO avanza** (*bloqueo de fila*), garantizando que ninguna fila se pierde.
+
+Cuando una fila se confirma con ACK → `[TX OK] Fila enviada` y el puntero avanza (el CSV cicla).
+
+### Parámetros ajustables
+
+```c
+#define HOP_ENABLED   false   // false = canal fijo (competencia); true = channel hopping
+#define FIXED_CH      0       // índice del canal fijo en channels[] (0 -> 915.9 MHz)
+#define TSLOT_MS      100     // ranura base del backoff (Cuadro 11.2)
+#define MAX_BACKOFF_K 5       // k máximo del BEB (ventana hasta 2^5·Tslot)
+#define ACK_TIMEOUT_MS 300    // espera de ACK tras transmitir
+#define TX_PERIOD_MS  2000    // separación entre filas enviadas con éxito
+```
+
+> Las 10 filas del CSV van **embebidas** en `csvRows[]` dentro del sketch (el MCU no lee el
+> archivo). Si tu CSV es distinto, edita ese arreglo. Backoff exponencial binario según el
+> Cuadro 11.2: `Wₖ = 2ᵏ · Tslot`.
+
+### Protocolo (TX ↔ RX)
+
+```
+DATA:  [0]=GRP_ID(0xA1) [1]=PKT_DATA(0x01) [2..3]=seq(LE) [4]=next_ch [5..]=payload CSV
+ACK:   [0]=GRP_ID(0xA1) [1]=PKT_ACK(0x02)  [2..3]=seq(LE)
+```
 
 ## 🟢 Nodo Receptor — `csma_rx.ino`
 
