@@ -13,11 +13,20 @@
  *                  Al detectar -> "*** PORTADORA INTERCEPTADA ***" + lock.
  *   2 -> CALIB   : Fase 2 - Calibracion pasiva. Escucha en la coordenada
  *                  detectada y mide RSSI / SNR de las tramas legitimas.
- *   3 -> ATTACK  : Fase 3 - Inyeccion activa. Inunda el canal detectado.
+ *   3 -> ATTACK  : Fase 3 - Inyeccion activa ADAPTATIVA (jammer seguidor).
+ *                  Inunda el canal detectado en rafagas; entre rafagas
+ *                  PAUSA y sensa (CAD) el canal objetivo. Si la pareja
+ *                  TX/RX huyo (canal en silencio) -> re-escanea la rejilla
+ *                  y salta automaticamente a la nueva frecuencia/SF.
  *                  Cadencia asimetrica modulada por GRUPO_ID.
+ *   4 -> SWEEP   : Ataque de BARRIDO contra salto de frecuencia. Inunda
+ *                  cada frecuencia de la rejilla un intervalo corto con un
+ *                  SF fijo y rota rapido. Cubre a una pareja que salta de
+ *                  frecuencia EN CADA PAQUETE (SF7). No requiere lock.
  *
  * Comandos extra por serial:
  *   gN        -> fija GRUPO_ID = N   (ej. "g3")          [default 1]
+ *   kN        -> fija el SF del barrido modo 4 (ej. "k7") [default 7]
  *   l F S     -> lock manual freq=F MHz, SF=S (ej. "l 919.1 7")
  *   r         -> reset del lock (olvida la coordenada detectada)
  *   s         -> muestra estado actual
@@ -75,6 +84,21 @@ const uint8_t SCAN_SFS[]   = {7, 9, 12};
 #define JAM_GROUP_SLOT_MS   15
 #define JAM_PAYLOAD_LEN     48   // payload grande -> mayor Time-on-Air
 
+// -------- Ataque ADAPTATIVO (jammer seguidor) --------
+// Duracion de cada rafaga de ataque (ms) antes de pausar a sensar.
+#define ATTACK_BURST_MS     4000
+// Escuchas CAD durante el sensado del canal objetivo.
+#define SENSE_CAD_TRIES     8
+// Sensados "libres" consecutivos para concluir que la pareja TX/RX huyo.
+#define SENSE_FREE_NEEDED   2
+
+// -------- Ataque de BARRIDO (modo 4, contra salto de frecuencia) --------
+// La pareja legitima salta de frecuencia EN CADA PAQUETE pero mantiene un
+// SF fijo. El jammer inunda cada frecuencia un intervalo corto y rota
+// rapido por toda la rejilla de frecuencias, cubriendo el salto.
+#define SWEEP_SF            7     // SF de inundacion (igual al de la pareja)
+#define SWEEP_DWELL_MS      150   // tiempo de inundacion por frecuencia
+
 // -------- Protocolo (solo para mimetizar la trama de ataque) --------
 #define GRP_ID_DUMMY  0xEE       // marca de jammer (no es de ningun grupo)
 
@@ -83,7 +107,7 @@ static SSD1306Wire oled(0x3c, 500000, SDA_OLED, SCL_OLED,
                         GEOMETRY_128_64, RST_OLED);
 
 // -------- Estado --------
-enum Mode { MODE_IDLE, MODE_SCAN, MODE_CALIB, MODE_ATTACK };
+enum Mode { MODE_IDLE, MODE_SCAN, MODE_CALIB, MODE_ATTACK, MODE_SWEEP };
 Mode mode = MODE_IDLE;
 
 uint8_t GRUPO_ID = 1;            // configurable por serial (default 1)
@@ -106,6 +130,19 @@ int8_t   lastSnr    = 0;
 // Contadores de ataque (Fase 3)
 uint32_t jamCount   = 0;
 uint8_t  jamPayload[JAM_PAYLOAD_LEN];
+
+// Sub-maquina de estados del ataque adaptativo
+enum AtkState { ATK_FLOOD, ATK_SENSE, ATK_RESCAN };
+AtkState atkState     = ATK_FLOOD;
+unsigned long burstStartMs = 0;
+uint8_t  freeStreak   = 0;     // sensados libres consecutivos
+bool     floodRetune  = true;  // re-sintonizar antes de volver a inundar
+
+// Estado del ataque de barrido (modo 4)
+uint8_t  sweepIdx      = 0;          // frecuencia actual del barrido
+uint8_t  sweepSf       = SWEEP_SF;   // SF de inundacion (configurable)
+unsigned long sweepFreqStart = 0;    // inicio del dwell en la freq actual
+bool     sweepRetune   = true;
 
 // Flag de recepcion (calibracion)
 volatile bool rxFlag = false;
@@ -137,6 +174,10 @@ bool applyRadio(float freq, uint8_t sf) {
   return ok;
 }
 
+// Helpers: frecuencia / SF a partir del indice de celda de la rejilla.
+float   cellFreq(uint8_t cell) { return SCAN_FREQS[cell / NUM_SFS]; }
+uint8_t cellSf  (uint8_t cell) { return SCAN_SFS[cell % NUM_SFS]; }
+
 void printMenu() {
   Serial.println();
   Serial.println(F("==================================================="));
@@ -145,8 +186,10 @@ void printMenu() {
   Serial.println(F("  0 -> IDLE   (standby)"));
   Serial.println(F("  1 -> SCAN   Fase 1: barrido espectral (CAD)"));
   Serial.println(F("  2 -> CALIB  Fase 2: medir RSSI/SNR (requiere lock)"));
-  Serial.println(F("  3 -> ATTACK Fase 3: inundar canal (requiere lock)"));
+  Serial.println(F("  3 -> ATTACK Fase 3: inundar + seguir saltos (req lock)"));
+  Serial.println(F("  4 -> SWEEP  barrido: inunda c/freq con SF fijo (sin lock)"));
   Serial.println(F("  gN     fija GRUPO_ID = N   (ej. g3)"));
+  Serial.println(F("  kN     fija SF del barrido modo 4 (ej. k7)"));
   Serial.println(F("  l F S  lock manual  (ej. l 919.1 7)"));
   Serial.println(F("  r      reset del lock"));
   Serial.println(F("  s      estado     |   h / ? ayuda"));
@@ -160,7 +203,8 @@ void showStatus() {
   Serial.printf("[ESTADO] modo=%s GRUPO_ID=%u lock=%s",
                 mode == MODE_IDLE   ? "IDLE"  :
                 mode == MODE_SCAN   ? "SCAN"  :
-                mode == MODE_CALIB  ? "CALIB" : "ATTACK",
+                mode == MODE_CALIB  ? "CALIB" :
+                mode == MODE_ATTACK ? "ATTACK" : "SWEEP",
                 GRUPO_ID, locked ? "SI" : "NO");
   if (locked) Serial.printf(" -> %.1f MHz SF%u", lockedFreq, lockedSf);
   Serial.println();
@@ -220,14 +264,18 @@ void lockCarrier(float freq, uint8_t sf, bool manual) {
 }
 
 // ============================================================
-//  Fase 1: barrido espectral (un sweep completo de las 12 celdas)
+//  Barrido espectral (un sweep completo de las 12 celdas)
+//  Devuelve: indice de celda si supera el umbral (lock),
+//            -1 si termino el barrido sin lock,
+//            -2 si se interrumpio por comando serial.
+//  'tag' es la etiqueta de log/OLED ("SCAN" o "RESCAN").
 // ============================================================
-void doScanSweep() {
+int scanOneSweep(const char *tag) {
   uint8_t bestCell = 0;
   for (uint8_t fi = 0; fi < NUM_FREQS; fi++) {
     for (uint8_t si = 0; si < NUM_SFS; si++) {
 
-      if (Serial.available()) return;   // permite interrumpir el barrido
+      if (Serial.available()) return -2;   // permite interrumpir el barrido
 
       float   f  = SCAN_FREQS[fi];
       uint8_t sf = SCAN_SFS[si];
@@ -239,33 +287,35 @@ void doScanSweep() {
       // del CAD al SF (SF12 dura mucho mas que SF7) automaticamente.
       int hitsThis = 0;
       for (uint8_t t = 0; t < CAD_TRIES_PER_CELL; t++) {
-        int st = radio.scanChannel();
-        if (st == RADIOLIB_LORA_DETECTED) hitsThis++;
+        if (radio.scanChannel() == RADIOLIB_LORA_DETECTED) hitsThis++;
         delay(2);
       }
       cellHits[cell] += hitsThis;
 
-      Serial.printf("[SCAN] %.1f MHz SF%-2u  CAD=%d/%d  acum=%u\n",
-                    f, sf, hitsThis, CAD_TRIES_PER_CELL, cellHits[cell]);
+      Serial.printf("[%s] %.1f MHz SF%-2u  CAD=%d/%d  acum=%u\n",
+                    tag, f, sf, hitsThis, CAD_TRIES_PER_CELL, cellHits[cell]);
 
-      // mejor celda hasta ahora (para mostrar)
       for (uint8_t c = 0; c < NUM_CELLS; c++)
         if (cellHits[c] > cellHits[bestCell]) bestCell = c;
 
-      oledShow("Fase1 SCAN " + String(GRUPO_ID),
+      oledShow(String(tag) + " G" + String(GRUPO_ID),
                "Probe " + String(f, 1) + " SF" + String(sf),
                "hits celda: " + String(cellHits[cell]),
-               "mejor: " + String(SCAN_FREQS[bestCell / NUM_SFS], 1) +
-                 " SF" + String(SCAN_SFS[bestCell % NUM_SFS]),
+               "mejor: " + String(cellFreq(bestCell), 1) +
+                 " SF" + String(cellSf(bestCell)),
                "best=" + String(cellHits[bestCell]) +
                  "/" + String(DETECT_THRESHOLD));
 
-      if (cellHits[cell] >= DETECT_THRESHOLD) {
-        lockCarrier(f, sf, false);
-        return;
-      }
+      if (cellHits[cell] >= DETECT_THRESHOLD) return cell;
     }
   }
+  return -1;
+}
+
+// Fase 1 (modo SCAN manual): barre hasta hacer lock y queda a la espera.
+void doScanMode() {
+  int c = scanOneSweep("SCAN");
+  if (c >= 0) lockCarrier(cellFreq(c), cellSf(c), false);
 }
 
 // ============================================================
@@ -334,14 +384,17 @@ void enterAttack() {
                      "o lock manual 'l F S'."));
     return;
   }
-  applyRadio(lockedFreq, lockedSf);
   // Payload de basura. La interferencia es efectiva porque comparte
   // EXACTAMENTE frecuencia + SF con la red legitima (ortogonalidad LoRa):
   // su preambulo dispara el CAD de los nodos (BUSY) y colisiona sus tramas.
   jamPayload[0] = GRP_ID_DUMMY;
   jamPayload[1] = GRUPO_ID;
   for (uint8_t i = 2; i < JAM_PAYLOAD_LEN; i++) jamPayload[i] = 0xA5 ^ i;
-  jamCount = 0;
+  jamCount    = 0;
+  freeStreak  = 0;
+  atkState    = ATK_FLOOD;
+  floodRetune = true;          // sintoniza la coordenada al entrar
+  burstStartMs = millis();
   mode = MODE_ATTACK;
   Serial.printf("[ATTACK] Inundando %.1f MHz SF%u  gap=%u ms (GRUPO_ID=%u)\n",
                 lockedFreq, lockedSf, GRUPO_ID * JAM_GROUP_SLOT_MS, GRUPO_ID);
@@ -351,25 +404,159 @@ void enterAttack() {
            "inundando...");
 }
 
+// Sensa el canal objetivo (el jammer NO transmite aqui): true si sigue
+// habiendo actividad (preambulo LoRa) -> la pareja TX/RX no ha huido.
+bool senseLockedChannel() {
+  applyRadio(lockedFreq, lockedSf);
+  int hits = 0;
+  for (uint8_t t = 0; t < SENSE_CAD_TRIES; t++) {
+    if (radio.scanChannel() == RADIOLIB_LORA_DETECTED) hits++;
+    delay(3);
+  }
+  Serial.printf("[SENSE] %.1f MHz SF%u  actividad=%d/%d\n",
+                lockedFreq, lockedSf, hits, SENSE_CAD_TRIES);
+  return hits > 0;
+}
+
 void doAttack() {
-  // varia el contenido para que cada trama sea distinta
+  switch (atkState) {
+
+    // ---- Inundacion del canal objetivo ----
+    case ATK_FLOOD: {
+      if (floodRetune) { applyRadio(lockedFreq, lockedSf); floodRetune = false; }
+
+      jamPayload[2] = (uint8_t)(jamCount & 0xFF);
+      jamPayload[3] = (uint8_t)((jamCount >> 8) & 0xFF);
+      int st = radio.transmit(jamPayload, JAM_PAYLOAD_LEN);  // bloqueante (~ToA)
+      if (st == RADIOLIB_ERR_NONE) jamCount++;
+
+      // Cadencia asimetrica por grupo (escalona los jammers).
+      delay(GRUPO_ID * JAM_GROUP_SLOT_MS);
+
+      if ((jamCount % 5) == 0) {
+        Serial.printf("[ATTACK] tramas=%lu  %.1f MHz SF%u\n",
+                      (unsigned long)jamCount, lockedFreq, lockedSf);
+        oledShow("Fase3 ATTACK",
+                 String(lockedFreq, 1) + " SF" + String(lockedSf),
+                 "GRUPO_ID:" + String(GRUPO_ID),
+                 "tramas: " + String(jamCount),
+                 "gap:" + String(GRUPO_ID * JAM_GROUP_SLOT_MS) + "ms");
+      }
+
+      // Fin de la rafaga -> pausar para sensar.
+      if (millis() - burstStartMs >= ATTACK_BURST_MS) atkState = ATK_SENSE;
+      break;
+    }
+
+    // ---- Pausa y sensado del canal objetivo ----
+    case ATK_SENSE: {
+      oledShow("Fase3 SENSE",
+               String(lockedFreq, 1) + " SF" + String(lockedSf),
+               "verificando...");
+      if (senseLockedChannel()) {
+        // Sigue ocupado por la pareja legitima -> seguir atacando.
+        freeStreak = 0;
+        floodRetune = true;
+        burstStartMs = millis();
+        atkState = ATK_FLOOD;
+      } else {
+        // Canal en silencio: puede que la pareja TX/RX haya huido.
+        freeStreak++;
+        Serial.printf("[ATTACK] objetivo en silencio (%u/%u)\n",
+                      freeStreak, SENSE_FREE_NEEDED);
+        if (freeStreak >= SENSE_FREE_NEEDED) {
+          Serial.println(F("[ATTACK] La pareja ESCAPO -> re-escaneando rejilla..."));
+          oledShow("OBJETIVO ESCAPO", "re-escaneando...");
+          for (uint8_t i = 0; i < NUM_CELLS; i++) cellHits[i] = 0;
+          atkState = ATK_RESCAN;
+        } else {
+          // Aun no confirmado: dar otra rafaga corta y re-sensar.
+          floodRetune = true;
+          burstStartMs = millis();
+          atkState = ATK_FLOOD;
+        }
+      }
+      break;
+    }
+
+    // ---- Re-escaneo automatico para encontrar el nuevo canal ----
+    case ATK_RESCAN: {
+      int c = scanOneSweep("RESCAN");
+      if (c >= 0) {
+        lockedFreq = cellFreq(c);
+        lockedSf   = cellSf(c);
+        locked     = true;
+        Serial.println();
+        Serial.println(F("*** NUEVA PORTADORA INTERCEPTADA (auto) ***"));
+        Serial.printf ("  -> %.1f MHz SF%u : reanudando ataque\n",
+                       lockedFreq, lockedSf);
+        oledShow("RE-LOCK!",
+                 String(lockedFreq, 1) + " MHz",
+                 "SF" + String(lockedSf),
+                 "reanudando atk");
+        freeStreak   = 0;
+        floodRetune  = true;
+        burstStartMs = millis();
+        atkState     = ATK_FLOOD;
+      }
+      // Si devuelve -1 (no halla nada) sigue re-escaneando en el proximo
+      // ciclo; si -2 (comando serial) handleSerial() cambiara el modo.
+      break;
+    }
+  }
+}
+
+// ============================================================
+//  Modo 4: ataque de BARRIDO (contra salto de frecuencia)
+// ============================================================
+void enterSweep() {
+  // No requiere lock: inunda TODAS las frecuencias de la rejilla.
+  jamPayload[0] = GRP_ID_DUMMY;
+  jamPayload[1] = GRUPO_ID;
+  for (uint8_t i = 2; i < JAM_PAYLOAD_LEN; i++) jamPayload[i] = 0xA5 ^ i;
+  jamCount     = 0;
+  sweepIdx     = 0;
+  sweepRetune  = true;
+  mode = MODE_SWEEP;
+  Serial.printf("[SWEEP] Barrido de %d freqs @ SF%u  dwell=%u ms (GRUPO_ID=%u)\n",
+                (int)NUM_FREQS, sweepSf, SWEEP_DWELL_MS, GRUPO_ID);
+  oledShow("Modo4 SWEEP",
+           "SF" + String(sweepSf) + "  dwell" + String(SWEEP_DWELL_MS),
+           String((int)NUM_FREQS) + " freqs rotando",
+           "GRUPO_ID:" + String(GRUPO_ID));
+}
+
+void doSweep() {
+  // Al cambiar de frecuencia, re-sintoniza e inicia el dwell.
+  if (sweepRetune) {
+    applyRadio(SCAN_FREQS[sweepIdx], sweepSf);
+    sweepFreqStart = millis();
+    sweepRetune = false;
+  }
+
+  // Inunda la frecuencia actual.
   jamPayload[2] = (uint8_t)(jamCount & 0xFF);
   jamPayload[3] = (uint8_t)((jamCount >> 8) & 0xFF);
-
   int st = radio.transmit(jamPayload, JAM_PAYLOAD_LEN);  // bloqueante (~ToA)
   if (st == RADIOLIB_ERR_NONE) jamCount++;
 
   // Cadencia asimetrica por grupo (escalona los jammers).
   delay(GRUPO_ID * JAM_GROUP_SLOT_MS);
 
-  if ((jamCount % 5) == 0) {
-    Serial.printf("[ATTACK] tramas=%lu  %.1f MHz SF%u\n",
-                  (unsigned long)jamCount, lockedFreq, lockedSf);
-    oledShow("Fase3 ATTACK",
-             String(lockedFreq, 1) + " SF" + String(lockedSf),
-             "GRUPO_ID:" + String(GRUPO_ID),
+  if ((jamCount % 4) == 0) {
+    Serial.printf("[SWEEP] %.1f MHz SF%u  tramas=%lu\n",
+                  SCAN_FREQS[sweepIdx], sweepSf, (unsigned long)jamCount);
+    oledShow("Modo4 SWEEP",
+             "Freq: " + String(SCAN_FREQS[sweepIdx], 1) + " SF" + String(sweepSf),
              "tramas: " + String(jamCount),
-             "gap:" + String(GRUPO_ID * JAM_GROUP_SLOT_MS) + "ms");
+             "dwell:" + String(SWEEP_DWELL_MS) + "ms",
+             "GRUPO_ID:" + String(GRUPO_ID));
+  }
+
+  // Fin del dwell -> saltar a la siguiente frecuencia.
+  if (millis() - sweepFreqStart >= SWEEP_DWELL_MS) {
+    sweepIdx = (sweepIdx + 1) % NUM_FREQS;
+    sweepRetune = true;
   }
 }
 
@@ -402,6 +589,19 @@ void handleSerial() {
 
     case '2': enterCalib();  break;
     case '3': enterAttack(); break;
+    case '4': enterSweep();  break;
+
+    case 'k': case 'K': {
+      int v = line.substring(1).toInt();
+      if (v >= 5 && v <= 12) {
+        sweepSf = (uint8_t)v;
+        Serial.printf("[CFG] SF de barrido (modo 4) = SF%u\n", sweepSf);
+        if (mode == MODE_SWEEP) sweepRetune = true;  // aplica en caliente
+      } else {
+        Serial.println(F("[CFG] SF invalido (5-12)"));
+      }
+      break;
+    }
 
     case 'g': case 'G': {
       int v = line.substring(1).toInt();
@@ -483,8 +683,9 @@ void loop() {
 
   switch (mode) {
     case MODE_IDLE:   break;
-    case MODE_SCAN:   doScanSweep(); break;
+    case MODE_SCAN:   doScanMode();  break;
     case MODE_CALIB:  doCalib();     break;
     case MODE_ATTACK: doAttack();    break;
+    case MODE_SWEEP:  doSweep();     break;
   }
 }

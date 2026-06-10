@@ -72,13 +72,15 @@ Implementa las tres fases de la Parte VI de la guía, **controladas por el Monit
 | `0`     | **IDLE**        | Radio en standby. |
 | `1`     | **SCAN** (Fase 1)  | Barrido espectral CAD sobre 4 freqs × 3 SF = **12 celdas**. Al detectar → `*** PORTADORA INTERCEPTADA ***` y queda *locked*. |
 | `2`     | **CALIB** (Fase 2) | Escucha pasiva en la coordenada detectada; mide RSSI/SNR (last/min/max/avg). Requiere lock. |
-| `3`     | **ATTACK** (Fase 3) | Inunda freq+SF detectados. Cadencia asimétrica = `GRUPO_ID × 15 ms`. Requiere lock. |
+| `3`     | **ATTACK** (Fase 3) | Inunda freq+SF detectados de forma **adaptativa** (jammer seguidor). Cadencia asimétrica = `GRUPO_ID × 15 ms`. Requiere lock. |
+| `4`     | **SWEEP**           | Ataque de **barrido**: inunda cada frecuencia de la rejilla un intervalo corto con un **SF fijo** y rota rápido. Contrarresta a una pareja que salta de frecuencia **en cada paquete**. No requiere lock. |
 
 ### Comandos extra
 
 | Comando   | Acción |
 |-----------|--------|
 | `gN`      | Fija `GRUPO_ID = N` (1–8). Ej: `g3` |
+| `kN`      | Fija el SF del barrido (modo 4). Ej: `k7` (aplica en caliente) |
 | `l F S`   | Lock manual: frecuencia `F` MHz, `SF S`. Ej: `l 919.1 7` |
 | `r`       | Reset del lock (olvida la coordenada) |
 | `s`       | Muestra el estado actual |
@@ -97,6 +99,57 @@ Implementa las tres fases de la Parte VI de la guía, **controladas por el Monit
 4. **Ataque por ortogonalidad:** transmite en **exactamente la misma frecuencia + SF**, con
    preámbulo y sync word, de modo que su señal dispara el CAD de los nodos legítimos (BUSY)
    y colisiona sus tramas. Payload de 48 B → mayor Time-on-Air.
+
+### Ataque adaptativo (jammer seguidor)
+
+Si la pareja TX/RX salta de frecuencia/SF al detectar que no hay comunicación (evasión), el
+jammer la persigue automáticamente mediante una sub-máquina de estados en la Fase 3:
+
+```
+   ┌──────────┐  ráfaga de ATTACK_BURST_MS   ┌──────────┐
+   │  FLOOD   │ ───────────────────────────▶ │  SENSE   │  (el jammer PAUSA y escucha CAD)
+   │ (inunda) │ ◀─── sigue ocupado ───────── │          │
+   └──────────┘                              └────┬─────┘
+        ▲                                         │ canal en silencio
+        │ nueva coordenada                        │ (SENSE_FREE_NEEDED veces)
+        │                                         ▼
+        │                                   ┌──────────┐
+        └────────────────────────────────  │  RESCAN  │  (re-barre la rejilla → nuevo lock)
+                                            └──────────┘
+```
+
+1. **FLOOD:** inunda el canal objetivo durante `ATTACK_BURST_MS`.
+2. **SENSE:** deja de transmitir y hace CAD sobre el canal objetivo. Como el jammer no
+   transmite aquí, puede oír si la pareja legítima **sigue ahí** (preámbulo detectado) o si
+   **huyó** (silencio).
+3. **RESCAN:** tras `SENSE_FREE_NEEDED` sensados en silencio, concluye que la pareja escapó,
+   re-escanea las 12 celdas (`*** NUEVA PORTADORA INTERCEPTADA (auto) ***`) y reanuda el
+   ataque en la nueva frecuencia/SF — sin intervención por serial.
+
+Parámetros: `ATTACK_BURST_MS` (4000), `SENSE_CAD_TRIES` (8), `SENSE_FREE_NEEDED` (2).
+
+### Ataque de barrido — modo `4` (contra salto de frecuencia por paquete)
+
+Cuando la pareja TX/RX **salta de frecuencia en cada paquete** manteniendo SF7, perseguir un
+solo canal no sirve. El modo SWEEP es un **jammer de barrido (barrage jammer)**: recorre las
+4 frecuencias inundando cada una un intervalo corto y rota tan rápido que cubre el salto.
+
+```
+915.9 ─flood─▶ 917.5 ─flood─▶ 919.1 ─flood─▶ 920.7 ─flood─▶ (repite)
+  └ SWEEP_DWELL_MS por frecuencia, todas con el mismo SF (sweepSf) ┘
+```
+
+- **No requiere lock:** inunda toda la rejilla de frecuencias.
+- **SF fijo** (`SWEEP_SF`, default 7) igual al de la pareja → interferencia efectiva por
+  ortogonalidad. Cámbialo en caliente con `kN` (ej. `k7`).
+- Con SF7 el ToA de una trama ronda los ~80 ms; un dwell de 150 ms da ~1–2 tramas por
+  frecuencia y un ciclo completo de las 4 en < 1 s, más rápido que el periodo de paquete
+  de la pareja.
+
+Parámetros: `SWEEP_SF` (7), `SWEEP_DWELL_MS` (150).
+
+> **Cuándo usar cada modo:** `3` ATTACK si la pareja usa **un canal fijo** (lo persigue si
+> evade). `4` SWEEP si la pareja **salta de frecuencia en cada paquete** con SF conocido.
 
 ### Parámetros ajustables (al inicio del sketch)
 
