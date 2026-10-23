@@ -1,4 +1,4 @@
-# Taller 11 — Acceso al Medio LoRa: CSMA/CA con CAD
+Acceso al Medio LoRa: CSMA/CA con CAD
 
 Implementación para el Taller 11 de **Redes Inalámbricas de Sensores (WSN)** — Universidad de Cuenca.
 Red LoRa sobre **Heltec WiFi LoRa 32 V3 (SX1262)** usando la librería **RadioLib (≥ v7.0)**.
